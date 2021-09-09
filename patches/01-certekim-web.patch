@@ -1,0 +1,1298 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..02952e7
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++.idea/
++main/main
+diff --git a/app/web/client/client.go b/app/web/client/client.go
+new file mode 100644
+index 0000000..a12de47
+--- /dev/null
++++ b/app/web/client/client.go
+@@ -0,0 +1,194 @@
++package client
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"log"
++
++	logCmd "github.com/xtls/xray-core/app/log/command"
++	proxymanCmd "github.com/xtls/xray-core/app/proxyman/command"
++	statsCmd "github.com/xtls/xray-core/app/stats/command"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/infra/conf"
++	"github.com/xtls/xray-core/proxy/vmess"
++	"google.golang.org/grpc"
++)
++
++var Client *ServiceClient
++
++type ServiceClient struct {
++	Address     string
++	Port        uint32
++	statClient  statsCmd.StatsServiceClient
++	proxyClient proxymanCmd.HandlerServiceClient
++	logClient   logCmd.LoggerServiceClient
++}
++
++func NewServiceClient(addr string, port uint32) *ServiceClient {
++	if addr == "" {
++		addr = "127.0.0.1"
++	}
++	if port == 0 {
++		return nil
++	}
++	cmdConn, err := grpc.Dial(fmt.Sprintf("%s:%d", addr, port), grpc.WithInsecure())
++	if err != nil {
++		newError(err)
++		return nil
++	}
++
++	svr := ServiceClient{Address: addr, Port: port,
++		statClient:  statsCmd.NewStatsServiceClient(cmdConn),
++		proxyClient: proxymanCmd.NewHandlerServiceClient(cmdConn),
++		logClient:   logCmd.NewLoggerServiceClient(cmdConn),
++	}
++	return &svr
++}
++
++func (h *ServiceClient) QueryStats(pattern string, reset bool) map[string]int64 {
++	sresp, err := h.statClient.QueryStats(context.Background(), &statsCmd.QueryStatsRequest{
++		Pattern: pattern,
++		Reset_:  reset,
++	})
++
++	result := make(map[string]int64)
++	if err != nil {
++		newError("failed to call grpc command: %v", err)
++	} else {
++		// log.Printf("%v", sresp)
++		for _, stat := range sresp.Stat {
++			result[stat.Name] = stat.Value
++		}
++	}
++
++	return result
++}
++
++func (h *ServiceClient) GetStats(name string, reset bool) (string, int64) {
++	sresp, err := h.statClient.GetStats(context.Background(), &statsCmd.GetStatsRequest{
++		Name:   name,
++		Reset_: reset,
++	})
++
++	if err != nil {
++		newError("%v", err)
++		return "", 0
++	}
++
++	return sresp.Stat.Name, sresp.Stat.Value
++}
++
++func (h *ServiceClient) GetStatsSys() *statsCmd.SysStatsResponse {
++	sresp, err := h.statClient.GetSysStats(context.Background(), &statsCmd.SysStatsRequest{})
++
++	if err != nil {
++		newError("%v", err)
++		return nil
++	}
++
++	return sresp
++}
++
++
++// AddUser ...
++//   Add a user to an inbound on the fly. The effect is not permentnent.
++func (h *ServiceClient) AddUser(inboundTag string, email string, level uint32, uuid string, alterID uint32) {
++	_, err := h.proxyClient.AlterInbound(context.Background(), &proxymanCmd.AlterInboundRequest{
++		Tag: inboundTag,
++		Operation: serial.ToTypedMessage(&proxymanCmd.AddUserOperation{
++			User: &protocol.User{
++				Level: level,
++				Email: email,
++				Account: serial.ToTypedMessage(&vmess.Account{
++					Id:               uuid,
++					AlterId:          alterID,
++					SecuritySettings: &protocol.SecurityConfig{Type: protocol.SecurityType_AUTO},
++				}),
++			},
++		}),
++	})
++
++	if err != nil {
++		newError("%v", err)
++	}
++}
++
++// RemoveUser ...
++//   Remove a user from an Inbound on the fly. The effect is not permentnent.
++func (h *ServiceClient) RemoveUser(inboundTag string, email string) {
++	_, err := h.proxyClient.AlterInbound(context.Background(), &proxymanCmd.AlterInboundRequest{
++		Tag: inboundTag,
++		Operation: serial.ToTypedMessage(&proxymanCmd.RemoveUserOperation{
++			Email: email,
++		}),
++	})
++
++	if err != nil {
++		newError("%v", err)
++	}
++}
++
++// RestartLogger
++// IDK if it will work :D
++func (h *ServiceClient) RestartLogger() {
++	_, err := h.logClient.RestartLogger(context.Background(), &logCmd.RestartLoggerRequest{})
++	if err != nil {
++		newError("%v", err)
++	}
++}
++
++func (h *ServiceClient) AddInbound(in []byte) {
++	var ins *conf.InboundDetourConfig
++	err := json.Unmarshal(in, &ins)
++	if err != nil {
++		log.Printf("failed to build conf: %s", err)
++	}
++	inbound, err := ins.Build()
++	if err != nil {
++		log.Printf("failed to build conf: %s", err)
++	}
++	_, err = h.proxyClient.AddInbound(context.Background(), &proxymanCmd.AddInboundRequest{
++		Inbound: inbound,
++	})
++	if err != nil {
++		newError("%v", err)
++	}
++}
++
++func (h *ServiceClient) AddOutbound(in []byte) {
++	var ins *conf.OutboundDetourConfig
++	err := json.Unmarshal(in, &ins)
++	if err != nil {
++		log.Printf("failed to build conf: %s", err)
++	}
++	outbound, err := ins.Build()
++	if err != nil {
++		log.Printf("failed to build conf: %s", err)
++	}
++	_, err = h.proxyClient.AddOutbound(context.Background(), &proxymanCmd.AddOutboundRequest{
++		Outbound: outbound,
++	})
++	if err != nil {
++		newError("%v", err)
++	}
++}
++
++func (h *ServiceClient) RemoveInbound(tag string) {
++	_, err := h.proxyClient.RemoveInbound(context.Background(), &proxymanCmd.RemoveInboundRequest{
++		Tag: tag,
++	})
++	if err != nil {
++		newError("%v", err)
++	}
++}
++
++func (h *ServiceClient) RemoveOutbound(tag string) {
++	_, err := h.proxyClient.RemoveOutbound(context.Background(), &proxymanCmd.RemoveOutboundRequest{
++		Tag: tag,
++	})
++	if err != nil {
++		newError("%v", err)
++	}
++}
+diff --git a/app/web/client/errors.generated.go b/app/web/client/errors.generated.go
+new file mode 100644
+index 0000000..1ed9507
+--- /dev/null
++++ b/app/web/client/errors.generated.go
+@@ -0,0 +1,9 @@
++package client
++
++import "github.com/xtls/xray-core/common/errors"
++
++type errPathObjHolder struct{}
++
++func newError(values ...interface{}) *errors.Error {
++	return errors.New(values...).WithPathObj(errPathObjHolder{})
++}
+diff --git a/app/web/config/config.pb.go b/app/web/config/config.pb.go
+new file mode 100644
+index 0000000..b516639
+--- /dev/null
++++ b/app/web/config/config.pb.go
+@@ -0,0 +1,330 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.25.0
++// 	protoc        v3.9.2
++// source: config.proto
++
++package config
++
++import (
++	proto "github.com/golang/protobuf/proto"
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	reflect "reflect"
++	sync "sync"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// This is a compile-time assertion that a sufficiently up-to-date version
++// of the legacy proto package is being used.
++const _ = proto.ProtoPackageIsVersion4
++
++// Config is the settings for Web;
++type Config struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	// Tag of the outbound handler that handles Webful API http connections.
++	Tag    string    `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
++	Api    *Api      `protobuf:"bytes,2,opt,name=api,proto3" json:"api,omitempty"`
++	Pprof  bool      `protobuf:"varint,3,opt,name=pprof,proto3" json:"pprof,omitempty"`
++	Static []*Static `protobuf:"bytes,4,rep,name=static,proto3" json:"static,omitempty"`
++}
++
++func (x *Config) Reset() {
++	*x = Config{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_config_proto_msgTypes[0]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *Config) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*Config) ProtoMessage() {}
++
++func (x *Config) ProtoReflect() protoreflect.Message {
++	mi := &file_config_proto_msgTypes[0]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use Config.ProtoReflect.Descriptor instead.
++func (*Config) Descriptor() ([]byte, []int) {
++	return file_config_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *Config) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
++func (x *Config) GetApi() *Api {
++	if x != nil {
++		return x.Api
++	}
++	return nil
++}
++
++func (x *Config) GetPprof() bool {
++	if x != nil {
++		return x.Pprof
++	}
++	return false
++}
++
++func (x *Config) GetStatic() []*Static {
++	if x != nil {
++		return x.Static
++	}
++	return nil
++}
++
++type Api struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Address string `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
++	Port    uint32 `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"`
++}
++
++func (x *Api) Reset() {
++	*x = Api{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_config_proto_msgTypes[1]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *Api) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*Api) ProtoMessage() {}
++
++func (x *Api) ProtoReflect() protoreflect.Message {
++	mi := &file_config_proto_msgTypes[1]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use Api.ProtoReflect.Descriptor instead.
++func (*Api) Descriptor() ([]byte, []int) {
++	return file_config_proto_rawDescGZIP(), []int{1}
++}
++
++func (x *Api) GetAddress() string {
++	if x != nil {
++		return x.Address
++	}
++	return ""
++}
++
++func (x *Api) GetPort() uint32 {
++	if x != nil {
++		return x.Port
++	}
++	return 0
++}
++
++type Static struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	FilePath string `protobuf:"bytes,1,opt,name=filePath,proto3" json:"filePath,omitempty"`
++	Uri      string `protobuf:"bytes,2,opt,name=uri,proto3" json:"uri,omitempty"`
++}
++
++func (x *Static) Reset() {
++	*x = Static{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_config_proto_msgTypes[2]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *Static) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*Static) ProtoMessage() {}
++
++func (x *Static) ProtoReflect() protoreflect.Message {
++	mi := &file_config_proto_msgTypes[2]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use Static.ProtoReflect.Descriptor instead.
++func (*Static) Descriptor() ([]byte, []int) {
++	return file_config_proto_rawDescGZIP(), []int{2}
++}
++
++func (x *Static) GetFilePath() string {
++	if x != nil {
++		return x.FilePath
++	}
++	return ""
++}
++
++func (x *Static) GetUri() string {
++	if x != nil {
++		return x.Uri
++	}
++	return ""
++}
++
++var File_config_proto protoreflect.FileDescriptor
++
++var file_config_proto_rawDesc = []byte{
++	0x0a, 0x0c, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x12, 0x13,
++	0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x77, 0x65, 0x62, 0x2e, 0x63, 0x6f, 0x6e,
++	0x66, 0x69, 0x67, 0x22, 0x91, 0x01, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x12, 0x10,
++	0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x74, 0x61, 0x67,
++	0x12, 0x2a, 0x0a, 0x03, 0x61, 0x70, 0x69, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x18, 0x2e,
++	0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x77, 0x65, 0x62, 0x2e, 0x63, 0x6f, 0x6e,
++	0x66, 0x69, 0x67, 0x2e, 0x61, 0x70, 0x69, 0x52, 0x03, 0x61, 0x70, 0x69, 0x12, 0x14, 0x0a, 0x05,
++	0x70, 0x70, 0x72, 0x6f, 0x66, 0x18, 0x03, 0x20, 0x01, 0x28, 0x08, 0x52, 0x05, 0x70, 0x70, 0x72,
++	0x6f, 0x66, 0x12, 0x33, 0x0a, 0x06, 0x73, 0x74, 0x61, 0x74, 0x69, 0x63, 0x18, 0x04, 0x20, 0x03,
++	0x28, 0x0b, 0x32, 0x1b, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x77, 0x65,
++	0x62, 0x2e, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2e, 0x73, 0x74, 0x61, 0x74, 0x69, 0x63, 0x52,
++	0x06, 0x73, 0x74, 0x61, 0x74, 0x69, 0x63, 0x22, 0x33, 0x0a, 0x03, 0x61, 0x70, 0x69, 0x12, 0x18,
++	0x0a, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x12, 0x12, 0x0a, 0x04, 0x70, 0x6f, 0x72, 0x74,
++	0x18, 0x02, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x04, 0x70, 0x6f, 0x72, 0x74, 0x22, 0x36, 0x0a, 0x06,
++	0x73, 0x74, 0x61, 0x74, 0x69, 0x63, 0x12, 0x1a, 0x0a, 0x08, 0x66, 0x69, 0x6c, 0x65, 0x50, 0x61,
++	0x74, 0x68, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x66, 0x69, 0x6c, 0x65, 0x50, 0x61,
++	0x74, 0x68, 0x12, 0x10, 0x0a, 0x03, 0x75, 0x72, 0x69, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x03, 0x75, 0x72, 0x69, 0x42, 0x5b, 0x0a, 0x17, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79,
++	0x2e, 0x61, 0x70, 0x70, 0x2e, 0x77, 0x65, 0x62, 0x2e, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x50,
++	0x01, 0x5a, 0x28, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74,
++	0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x61, 0x70, 0x70,
++	0x2f, 0x77, 0x65, 0x62, 0x2f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0xaa, 0x02, 0x13, 0x58, 0x72,
++	0x61, 0x79, 0x2e, 0x41, 0x70, 0x70, 0x2e, 0x57, 0x65, 0x62, 0x2e, 0x43, 0x6f, 0x6e, 0x66, 0x69,
++	0x67, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++}
++
++var (
++	file_config_proto_rawDescOnce sync.Once
++	file_config_proto_rawDescData = file_config_proto_rawDesc
++)
++
++func file_config_proto_rawDescGZIP() []byte {
++	file_config_proto_rawDescOnce.Do(func() {
++		file_config_proto_rawDescData = protoimpl.X.CompressGZIP(file_config_proto_rawDescData)
++	})
++	return file_config_proto_rawDescData
++}
++
++var file_config_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
++var file_config_proto_goTypes = []interface{}{
++	(*Config)(nil), // 0: xray.app.web.config.Config
++	(*Api)(nil),    // 1: xray.app.web.config.api
++	(*Static)(nil), // 2: xray.app.web.config.static
++}
++var file_config_proto_depIdxs = []int32{
++	1, // 0: xray.app.web.config.Config.api:type_name -> xray.app.web.config.api
++	2, // 1: xray.app.web.config.Config.static:type_name -> xray.app.web.config.static
++	2, // [2:2] is the sub-list for method output_type
++	2, // [2:2] is the sub-list for method input_type
++	2, // [2:2] is the sub-list for extension type_name
++	2, // [2:2] is the sub-list for extension extendee
++	0, // [0:2] is the sub-list for field type_name
++}
++
++func init() { file_config_proto_init() }
++func file_config_proto_init() {
++	if File_config_proto != nil {
++		return
++	}
++	if !protoimpl.UnsafeEnabled {
++		file_config_proto_msgTypes[0].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*Config); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_config_proto_msgTypes[1].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*Api); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_config_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*Static); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: file_config_proto_rawDesc,
++			NumEnums:      0,
++			NumMessages:   3,
++			NumExtensions: 0,
++			NumServices:   0,
++		},
++		GoTypes:           file_config_proto_goTypes,
++		DependencyIndexes: file_config_proto_depIdxs,
++		MessageInfos:      file_config_proto_msgTypes,
++	}.Build()
++	File_config_proto = out.File
++	file_config_proto_rawDesc = nil
++	file_config_proto_goTypes = nil
++	file_config_proto_depIdxs = nil
++}
+diff --git a/app/web/config/config.proto b/app/web/config/config.proto
+new file mode 100644
+index 0000000..bef72c6
+--- /dev/null
++++ b/app/web/config/config.proto
+@@ -0,0 +1,27 @@
++syntax = "proto3";
++
++package xray.app.web.config;
++option csharp_namespace = "Xray.App.Web.Config";
++option go_package = "github.com/xtls/xray-core/app/web/config";
++option java_package = "com.xray.app.web.config";
++option java_multiple_files = true;
++
++// Config is the settings for Web;
++message Config {
++    // Tag of the outbound handler that handles Webful API http connections.
++    string tag = 1;
++    api api = 2;
++    bool pprof = 3;
++    repeated static static = 4;
++}
++
++message api {
++    string address = 1;
++    uint32 port = 2;
++}
++
++
++message static {
++    string filePath = 1;
++    string uri = 2;
++}
+diff --git a/app/web/errors.generated.go b/app/web/errors.generated.go
+new file mode 100644
+index 0000000..4225409
+--- /dev/null
++++ b/app/web/errors.generated.go
+@@ -0,0 +1,9 @@
++package web
++
++import "github.com/xtls/xray-core/common/errors"
++
++type errPathObjHolder struct{}
++
++func newError(values ...interface{}) *errors.Error {
++	return errors.New(values...).WithPathObj(errPathObjHolder{})
++}
+diff --git a/app/web/handler/errors.generated.go b/app/web/handler/errors.generated.go
+new file mode 100644
+index 0000000..711efcf
+--- /dev/null
++++ b/app/web/handler/errors.generated.go
+@@ -0,0 +1,9 @@
++package handler
++
++import "github.com/xtls/xray-core/common/errors"
++
++type errPathObjHolder struct{}
++
++func newError(values ...interface{}) *errors.Error {
++	return errors.New(values...).WithPathObj(errPathObjHolder{})
++}
+diff --git a/app/web/handler/inbound.go b/app/web/handler/inbound.go
+new file mode 100644
+index 0000000..c3ae768
+--- /dev/null
++++ b/app/web/handler/inbound.go
+@@ -0,0 +1,30 @@
++package handler
++
++import (
++	"net/http"
++
++	"github.com/julienschmidt/httprouter"
++	"github.com/xtls/xray-core/app/web/client"
++	"github.com/xtls/xray-core/common/log"
++)
++
++//"Content-Type: application/json"
++func AddInboundHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
++	res, err, _ := Convert(r)
++	if err != nil {
++		newError(err)
++		return
++	}
++	client.Client.AddInbound(res)
++}
++
++func RemoveInboundHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
++	data := ps.ByName("tag")
++	log.Record(&log.AccessMessage{
++		From:   "Web",
++		To:     "RemoveInboundHandler",
++		Status: log.AccessAccepted,
++		Detour: data,
++	})
++	client.Client.RemoveInbound(data)
++}
+diff --git a/app/web/handler/outbound.go b/app/web/handler/outbound.go
+new file mode 100644
+index 0000000..8193f48
+--- /dev/null
++++ b/app/web/handler/outbound.go
+@@ -0,0 +1,29 @@
++package handler
++
++import (
++	"net/http"
++
++	"github.com/julienschmidt/httprouter"
++	"github.com/xtls/xray-core/app/web/client"
++	"github.com/xtls/xray-core/common/log"
++)
++
++func AddOutboundHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
++	res, err, _ := Convert(r)
++	if err != nil {
++		newError(err)
++		return
++	}
++	client.Client.AddOutbound(res)
++}
++
++func RemoveOutboundHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
++	data := ps.ByName("tag")
++	log.Record(&log.AccessMessage{
++		From:   "Web",
++		To:     "RemoveOutboundHandler",
++		Status: log.AccessAccepted,
++		Detour: data,
++	})
++	client.Client.RemoveOutbound(data)
++}
+diff --git a/app/web/handler/stats.go b/app/web/handler/stats.go
+new file mode 100644
+index 0000000..26889d3
+--- /dev/null
++++ b/app/web/handler/stats.go
+@@ -0,0 +1,60 @@
++package handler
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"time"
++
++	"github.com/julienschmidt/httprouter"
++	"github.com/xtls/xray-core/app/web/client"
++)
++
++var boot time.Time
++
++func init() {
++	boot = time.Now()
++}
++
++func GetSysStatsHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
++	response := client.Client.GetStatsSys()
++	if response == nil {
++		fmt.Fprintf(w, "{}")
++	}
++	ret, err := json.Marshal(response)
++	if err != nil {
++		newError(err)
++	} else {
++		fmt.Fprintf(w, "%s\n", string(ret))
++	}
++}
++
++func GetStatsHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
++	data := ps.ByName("name")
++	_, value := client.Client.GetStats(data, false)
++	fmt.Fprintf(w, "%s\n", fmt.Sprintf("%v", value))
++}
++
++func QueryStatsHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
++	data := ps.ByName("pattern")
++	pattern := client.Client.QueryStats(data, false)
++	sub := make(map[string]interface{})
++	for key, val := range pattern {
++		sub[key] = val
++	}
++	var stat []map[string]interface{}
++	stat = append(stat, sub)
++
++	buf := new(bytes.Buffer)
++	enc := json.NewEncoder(buf)
++	enc.SetEscapeHTML(false)
++
++	err := enc.Encode(&stat)
++	if err != nil {
++		newError("failed to convert json")
++		return
++	}
++	//working
++	fmt.Fprintf(w, "%s\n", buf.String())
++}
+diff --git a/app/web/handler/utils.go b/app/web/handler/utils.go
+new file mode 100644
+index 0000000..7fdb5cc
+--- /dev/null
++++ b/app/web/handler/utils.go
+@@ -0,0 +1,27 @@
++package handler
++
++import (
++	"encoding/json"
++	"log"
++	"net/http"
++)
++
++func Convert(r *http.Request) ([]byte, error, map[string]interface{}) {
++	err := r.ParseForm()
++	if err != nil {
++		log.Println(err)
++		return nil, err, nil
++	}
++	decoder := json.NewDecoder(r.Body)
++	var params map[string]interface{}
++	if err := decoder.Decode(&params); err != nil {
++		log.Println(err)
++		return nil, err, nil
++	}
++	res, err := json.Marshal(params)
++	if err != nil {
++		log.Println(err)
++		return nil, err, nil
++	}
++	return res, nil, params
++}
+diff --git a/app/web/outbound.go b/app/web/outbound.go
+new file mode 100644
+index 0000000..37ebd12
+--- /dev/null
++++ b/app/web/outbound.go
+@@ -0,0 +1,109 @@
++package web
++
++import (
++	"context"
++	"sync"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/net/cnc"
++	"github.com/xtls/xray-core/common/signal/done"
++	"github.com/xtls/xray-core/transport"
++)
++
++// OutboundListener is a net.Listener for listening http connections.
++type OutboundListener struct {
++	buffer chan net.Conn
++	done   *done.Instance
++}
++
++func (l *OutboundListener) add(conn net.Conn) {
++	select {
++	case l.buffer <- conn:
++	case <-l.done.Wait():
++		conn.Close()
++	default:
++		conn.Close()
++	}
++}
++
++// Accept implements net.Listener.
++func (l *OutboundListener) Accept() (net.Conn, error) {
++	select {
++	case <-l.done.Wait():
++		return nil, newError("listen closed")
++	case c := <-l.buffer:
++		return c, nil
++	}
++}
++
++// Close implement net.Listener.
++func (l *OutboundListener) Close() error {
++	common.Must(l.done.Close())
++L:
++	for {
++		select {
++		case c := <-l.buffer:
++			c.Close()
++		default:
++			break L
++		}
++	}
++	return nil
++}
++
++// Addr implements net.Listener.
++func (l *OutboundListener) Addr() net.Addr {
++	return &net.TCPAddr{
++		IP:   net.IP{0, 0, 0, 0},
++		Port: 0,
++	}
++}
++
++// Outbound is a outbound.Handler that handles http connections.
++type Outbound struct {
++	tag      string
++	listener *OutboundListener
++	access   sync.RWMutex
++	closed   bool
++}
++
++// Dispatch implements outbound.Handler.
++func (co *Outbound) Dispatch(ctx context.Context, link *transport.Link) {
++	co.access.RLock()
++
++	if co.closed {
++		common.Interrupt(link.Reader)
++		common.Interrupt(link.Writer)
++		co.access.RUnlock()
++		return
++	}
++
++	closeSignal := done.New()
++	c := cnc.NewConnection(cnc.ConnectionInputMulti(link.Writer), cnc.ConnectionOutputMulti(link.Reader), cnc.ConnectionOnClose(closeSignal))
++	co.listener.add(c)
++	co.access.RUnlock()
++	<-closeSignal.Wait()
++}
++
++// Tag implements outbound.Handler.
++func (co *Outbound) Tag() string {
++	return co.tag
++}
++
++// Start implements common.Runnable.
++func (co *Outbound) Start() error {
++	co.access.Lock()
++	co.closed = false
++	co.access.Unlock()
++	return nil
++}
++
++// Close implements common.Closable.
++func (co *Outbound) Close() error {
++	co.access.Lock()
++	defer co.access.Unlock()
++
++	co.closed = true
++	return co.listener.Close()
++}
+diff --git a/app/web/router.go b/app/web/router.go
+new file mode 100644
+index 0000000..9d519cb
+--- /dev/null
++++ b/app/web/router.go
+@@ -0,0 +1,52 @@
++package web
++
++import (
++	"fmt"
++	"net/http"
++
++	"github.com/julienschmidt/httprouter"
++	"github.com/xtls/xray-core/app/web/client"
++	"github.com/xtls/xray-core/app/web/handler"
++	"github.com/xtls/xray-core/core"
++)
++
++func Default(config *WebHandler) *httprouter.Router {
++	router := httprouter.New()
++
++	if config.api.port != 0 {
++		client.Client = client.NewServiceClient(config.api.address, config.api.port)
++		router.GET("/api/v1/statssys", handler.GetSysStatsHandler)
++		router.GET("/api/v1/statsquery", handler.QueryStatsHandler)
++		router.GET("/api/v1/statsquery/:pattern", handler.QueryStatsHandler)
++		router.GET("/api/v1/stats", handler.GetStatsHandler)
++		router.GET("/api/v1/stats/:name", handler.GetStatsHandler)
++		router.DELETE("/api/v1/inbounds/:tag", handler.RemoveInboundHandler)
++		router.POST("/api/v1/inbounds", handler.AddInboundHandler)
++		router.DELETE("/api/v1/outbounds/:tag", handler.RemoveOutboundHandler)
++		router.POST("/api/v1/outbounds", handler.AddOutboundHandler)
++	}
++
++	if config.pprof {
++		router.Handler(http.MethodGet, "/debug/pprof/*item", http.DefaultServeMux)
++	}
++
++	if config.static != nil {
++		for _, s := range config.static {
++			if s.uri == "/" {
++				router.NotFound = http.FileServer(http.Dir(s.filePath))
++			} else {
++				router.ServeFiles(s.uri+"/*filepath", http.Dir(s.filePath))
++			}
++		}
++	} else {
++		router.GET("/", DefaultHandler)
++	}
++
++	return router
++}
++
++func DefaultHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
++	for _, s := range core.VersionStatement() {
++		fmt.Fprintf(w, "%s\n", s)
++	}
++}
+diff --git a/app/web/web.go b/app/web/web.go
+new file mode 100644
+index 0000000..8992306
+--- /dev/null
++++ b/app/web/web.go
+@@ -0,0 +1,92 @@
++package web
++
++import (
++	"context"
++	"net/http"
++	_ "net/http/pprof"
++
++	"github.com/xtls/xray-core/app/web/config"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/signal/done"
++	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/features/outbound"
++)
++
++type WebHandler struct {
++	ohm    outbound.Manager
++	tag    string
++	api    Api
++	pprof  bool
++	static []Static
++}
++
++type Api struct {
++	address string
++	port    uint32
++}
++
++type Static struct {
++	filePath string
++	uri      string
++}
++
++// New
++func NewWebHandler(ctx context.Context, config *config.Config) (*WebHandler, error) {
++	c := &WebHandler{
++		tag: config.Tag,
++		api: Api{
++			address: config.Api.Address,
++			port:    config.Api.Port,
++		},
++		pprof: config.Pprof,
++	}
++
++	for _, s := range config.Static {
++		c.static = append(c.static, Static{
++			filePath: s.FilePath,
++			uri:      s.Uri,
++		})
++	}
++
++	common.Must(core.RequireFeatures(ctx, func(om outbound.Manager) {
++		c.ohm = om
++	}))
++	return c, nil
++}
++
++func (r *WebHandler) Type() interface{} {
++	return (*WebHandler)(nil)
++}
++
++func (r *WebHandler) Start() error {
++	listener := &OutboundListener{
++		buffer: make(chan net.Conn, 4),
++		done:   done.New(),
++	}
++
++	go func() {
++		if err := http.Serve(listener, Default(r)); err != nil {
++			newError("failed to start Web server").Base(err).AtError().WriteToLog()
++		}
++	}()
++
++	if err := r.ohm.RemoveHandler(context.Background(), r.tag); err != nil {
++		newError("failed to remove existing handler").WriteToLog()
++	}
++
++	return r.ohm.AddHandler(context.Background(), &Outbound{
++		tag:      r.tag,
++		listener: listener,
++	})
++}
++
++func (r *WebHandler) Close() error {
++	return nil
++}
++
++func init() {
++	common.Must(common.RegisterConfig((*config.Config)(nil), func(ctx context.Context, cfg interface{}) (interface{}, error) {
++		return NewWebHandler(ctx, cfg.(*config.Config))
++	}))
++}
+diff --git a/go.mod b/go.mod
+index 64feb98..acdd3d2 100644
+--- a/go.mod
++++ b/go.mod
+@@ -32,6 +32,7 @@ require (
+ 	github.com/dgryski/go-metro v0.0.0-20211015221634-2661b20a2446 // indirect
+ 	github.com/fsnotify/fsnotify v1.5.1 // indirect
+ 	github.com/go-task/slim-sprig v0.0.0-20210107165309-348f09dbbbc0 // indirect
++	github.com/julienschmidt/httprouter v1.3.0
+ 	github.com/marten-seemann/qtls-go1-16 v0.1.4 // indirect
+ 	github.com/marten-seemann/qtls-go1-17 v0.1.0 // indirect
+ 	github.com/nxadm/tail v1.4.8 // indirect
+diff --git a/go.sum b/go.sum
+index 83143d5..643b90b 100644
+--- a/go.sum
++++ b/go.sum
+@@ -31,7 +31,6 @@ github.com/coreos/go-systemd v0.0.0-20181012123002-c6f51f82210d/go.mod h1:F5haX7
+ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+-github.com/dgryski/go-metro v0.0.0-20200812162917-85c65e2d0165 h1:BS21ZUJ/B5X2UVUbczfmdWH7GapPWAhxcMsDnjJTU1E=
+ github.com/dgryski/go-metro v0.0.0-20200812162917-85c65e2d0165/go.mod h1:c9O8+fpSOX1DM8cPNSkX/qsBWdkD4yd2dpciOWQjpBw=
+ github.com/dgryski/go-metro v0.0.0-20211015221634-2661b20a2446 h1:QnWGyQI3H080vbC9E4jlr6scOYEnALtvV/69oATYzOo=
+ github.com/dgryski/go-metro v0.0.0-20211015221634-2661b20a2446/go.mod h1:c9O8+fpSOX1DM8cPNSkX/qsBWdkD4yd2dpciOWQjpBw=
+@@ -108,6 +107,8 @@ github.com/hpcloud/tail v1.0.0/go.mod h1:ab1qPbhIpdTxEkNHXyeSf5vhxWSCs/tWer42PpO
+ github.com/jellevandenhooff/dkim v0.0.0-20150330215556-f50fe3d243e1/go.mod h1:E0B/fFc00Y+Rasa88328GlI/XbtyysCtTHZS8h7IrBU=
+ github.com/json-iterator/go v1.1.6/go.mod h1:+SdeFBvtyEkXs7REEP0seUULqWtbJapLOCVDaaPEHmU=
+ github.com/jstemmer/go-junit-report v0.0.0-20190106144839-af01ea7f8024/go.mod h1:6v2b51hI/fHJwM22ozAgKL4VKDeJcHhJFhtBdhmNjmU=
++github.com/julienschmidt/httprouter v1.3.0 h1:U0609e9tgbseu3rBINet9P48AI/D3oJs4dN7jwJOQ1U=
++github.com/julienschmidt/httprouter v1.3.0/go.mod h1:JR6WtHb+2LUe8TCKY3cZOxFyyO8IZAc4RVcycCCAKdM=
+ github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
+ github.com/kr/pretty v0.1.0 h1:L/CwN0zerZDmRFUapSPitk6f+Q3+0za1rQkzVuMiMFI=
+ github.com/kr/pretty v0.1.0/go.mod h1:dAy3ld7l9f0ibDNOQOHHMYYIIbhfbHSm3C4ZsoJORNo=
+@@ -140,7 +141,6 @@ github.com/onsi/ginkgo v1.6.0/go.mod h1:lLunBs/Ym6LB5Z9jYTR76FiuTmxDTDusOGeTQH+W
+ github.com/onsi/ginkgo v1.12.1/go.mod h1:zj2OWP4+oCPe1qIXoGWkgMRwljMUYCdkwsT2108oapk=
+ github.com/onsi/ginkgo v1.14.0/go.mod h1:iSB4RoI2tjJc9BBv4NKIKWKya62Rps+oPG/Lv9klQyY=
+ github.com/onsi/ginkgo v1.16.2/go.mod h1:CObGmKUOKaSC0RjmoAK7tKyn4Azo5P2IWuoMnvwxz1E=
+-github.com/onsi/ginkgo v1.16.4 h1:29JGrr5oVBm5ulCWet69zQkzWipVXIol6ygQUe/EzNc=
+ github.com/onsi/ginkgo v1.16.4/go.mod h1:dX+/inL/fNMqNlz0e9LfyB9TswhZpCVdJM/Z6Vvnwo0=
+ github.com/onsi/ginkgo v1.16.5 h1:8xi0RTUf59SOSfEtZMvwTvXYMzG4gV23XVHOZiXNtnE=
+ github.com/onsi/ginkgo v1.16.5/go.mod h1:+E8gABHa3K6zRBolWtd+ROzc/U5bkGt0FwiG042wbpU=
+@@ -210,9 +210,8 @@ github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9dec
+ github.com/yuin/goldmark v1.3.5/go.mod h1:mwnBkeHKe2W/ZEtQ+71ViKU8L12m81fl3OWwC1Zlc8k=
+ github.com/yuin/goldmark v1.4.0/go.mod h1:mwnBkeHKe2W/ZEtQ+71ViKU8L12m81fl3OWwC1Zlc8k=
+ go.opencensus.io v0.18.0/go.mod h1:vKdFvxhtzZ9onBp9VKHK8z/sRpBMnKAsufL7wlDrCOA=
++go.opencensus.io v0.18.0/go.mod h1:vKdFvxhtzZ9onBp9VKHK8z/sRpBMnKAsufL7wlDrCOA=
+ go.opentelemetry.io/proto/otlp v0.7.0/go.mod h1:PqfVotwruBrMGOCsRd/89rSnXhoiJIqeYNgFYFoEGnI=
+-go.starlark.net v0.0.0-20210901212718-87f333178d59 h1:F8ArBy9n1l7HE1JjzOIYqweEqoUlywy5+L3bR0tIa9g=
+-go.starlark.net v0.0.0-20210901212718-87f333178d59/go.mod h1:t3mmBBPzAVvK0L0n1drDmrQsJ8FoIx4INCqVMTr/Zo0=
+ go.starlark.net v0.0.0-20211013185944-b0039bd2cfe3 h1:oBcONsksxvpeodDrLjiMDaKHXKAVVfAydhe/792CE/o=
+ go.starlark.net v0.0.0-20211013185944-b0039bd2cfe3/go.mod h1:t3mmBBPzAVvK0L0n1drDmrQsJ8FoIx4INCqVMTr/Zo0=
+ go4.org v0.0.0-20180809161055-417644f6feb5/go.mod h1:MkTOUMDaeVYJUOUsaDXIhWPZYa1yOyC1qaOBpL57BhE=
+@@ -224,8 +223,6 @@ golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8U
+ golang.org/x/crypto v0.0.0-20200221231518-2aa609cf4a9d/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
+ golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
+ golang.org/x/crypto v0.0.0-20210817164053-32db794688a5/go.mod h1:GvvjBRRGRdwPK5ydBHafDWAxML/pGHZbMvKqRZ5+Abc=
+-golang.org/x/crypto v0.0.0-20210920023735-84f357641f63 h1:kETrAMYZq6WVGPa8IIixL0CaEcIUNi+1WX7grUoi3y8=
+-golang.org/x/crypto v0.0.0-20210920023735-84f357641f63/go.mod h1:GvvjBRRGRdwPK5ydBHafDWAxML/pGHZbMvKqRZ5+Abc=
+ golang.org/x/crypto v0.0.0-20210921155107-089bfa567519 h1:7I4JAnoQBe7ZtJcBaYHi5UtiO8tQHbUSXxL+pnGRANg=
+ golang.org/x/crypto v0.0.0-20210921155107-089bfa567519/go.mod h1:GvvjBRRGRdwPK5ydBHafDWAxML/pGHZbMvKqRZ5+Abc=
+ golang.org/x/exp v0.0.0-20190121172915-509febef88a4/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
+@@ -233,12 +230,8 @@ golang.org/x/lint v0.0.0-20180702182130-06c8688daad7/go.mod h1:UVdnD1Gm6xHRNCYTk
+ golang.org/x/lint v0.0.0-20181026193005-c67002cb31c3/go.mod h1:UVdnD1Gm6xHRNCYTkRU2/jEulfH38KcIWyp/GAMgvoE=
+ golang.org/x/lint v0.0.0-20190227174305-5b3e6a55c961/go.mod h1:wehouNa3lNwaWXcvxsM5YxQ5yQlVC4a0KAMCusXpPoU=
+ golang.org/x/lint v0.0.0-20190313153728-d0100b6bd8b3/go.mod h1:6SW0HCj/g11FgYtHlgUYUwCkIfeOF89ocIRzGO/8vkc=
+-golang.org/x/lint v0.0.0-20210508222113-6edffad5e616/go.mod h1:3xt1FjdF8hUf6vQPIChWIBhFzV8gjjsPE/fR3IyQdNY=
+-golang.org/x/mod v0.1.1-0.20191105210325-c90efee705ee/go.mod h1:QqPTAvyqsEbceGzBzNggFXnrqF1CaUcvgkdR5Ot7KZg=
+ golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+ golang.org/x/mod v0.4.2/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+-golang.org/x/mod v0.5.0 h1:UG21uOlmZabA4fW5i7ZX6bjw1xELEGg/ZLgZq9auk/Q=
+-golang.org/x/mod v0.5.0/go.mod h1:5OXOZSfqPIIbmVBIIKWRFfZjPR0E5r58TLhUjH0a2Ro=
+ golang.org/x/mod v0.5.1 h1:OJxoQ/rynoF0dcCdI7cLPktw/hR2cueqYfjm43oqK38=
+ golang.org/x/mod v0.5.1/go.mod h1:5OXOZSfqPIIbmVBIIKWRFfZjPR0E5r58TLhUjH0a2Ro=
+ golang.org/x/net v0.0.0-20180724234803-3673e40ba225/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+@@ -260,8 +253,6 @@ golang.org/x/net v0.0.0-20210226172049-e18ecbb05110/go.mod h1:m0MpNAwzfU5UDzcl9v
+ golang.org/x/net v0.0.0-20210405180319-a5a99cb37ef4/go.mod h1:p54w0d4576C0XHj96bSt6lcn1PtDYWL6XObtHCRCNQM=
+ golang.org/x/net v0.0.0-20210428140749-89ef3d95e781/go.mod h1:OJAsFXCWl8Ukc7SiCT/9KSuxbyM7479/AVlXFRxuMCk=
+ golang.org/x/net v0.0.0-20210805182204-aaa1db679c0d/go.mod h1:9nx3DQGgdP8bBQD5qxJ1jj9UTztislL4KSBs9R2vV5Y=
+-golang.org/x/net v0.0.0-20210917221730-978cfadd31cf h1:R150MpwJIv1MpS0N/pc+NhTM8ajzvlmxlY5OYsrevXQ=
+-golang.org/x/net v0.0.0-20210917221730-978cfadd31cf/go.mod h1:9nx3DQGgdP8bBQD5qxJ1jj9UTztislL4KSBs9R2vV5Y=
+ golang.org/x/net v0.0.0-20211020060615-d418f374d309 h1:A0lJIi+hcTR6aajJH4YqKWwohY4aW9RO7oRMcdv+HKI=
+ golang.org/x/net v0.0.0-20211020060615-d418f374d309/go.mod h1:9nx3DQGgdP8bBQD5qxJ1jj9UTztislL4KSBs9R2vV5Y=
+ golang.org/x/oauth2 v0.0.0-20180821212333-d2e6202438be/go.mod h1:N/0e6XlmueqKjAGxoOufVs8QHGRruUQn6yWY3a++T0U=
+@@ -301,8 +292,6 @@ golang.org/x/sys v0.0.0-20210615035016-665e8c7367d1/go.mod h1:oPkhp1MJrh7nUepCBc
+ golang.org/x/sys v0.0.0-20210630005230-0f9fa26af87c/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20210809222454-d867a43fc93e/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20210908233432-aa78b53d3365/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/sys v0.0.0-20210917161153-d61c044b1678 h1:J27LZFQBFoihqXoegpscI10HpjZ7B5WQLLKL2FZXQKw=
+-golang.org/x/sys v0.0.0-20210917161153-d61c044b1678/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20211020064051-0ec99a608a1b h1:byBDhtWGQmWDrv1MlEv/BzGRMkw36h9QqsNnZQcDhRw=
+ golang.org/x/sys v0.0.0-20211020064051-0ec99a608a1b/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
+@@ -325,12 +314,8 @@ golang.org/x/tools v0.0.0-20190311212946-11955173bddd/go.mod h1:LCzVGOaR6xXOjkQ3
+ golang.org/x/tools v0.0.0-20190425150028-36563e24a262/go.mod h1:RgjU9mgBXZiqYHBnxXauZ1Gv1EHHAz9KjViQ78xBX0Q=
+ golang.org/x/tools v0.0.0-20190524140312-2c0ae7006135/go.mod h1:RgjU9mgBXZiqYHBnxXauZ1Gv1EHHAz9KjViQ78xBX0Q=
+ golang.org/x/tools v0.0.0-20191119224855-298f0cb1881e/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
+-golang.org/x/tools v0.0.0-20200130002326-2f3ba24bd6e7/go.mod h1:TB2adYChydJhpapKDTa4BR/hXlZSLoq2Wpct/0txZ28=
+ golang.org/x/tools v0.0.0-20201224043029-2b0845dc783e/go.mod h1:emZCQorbCU4vsT4fOWvOPXz4eW1wZW4PmDk9uLelYpA=
+ golang.org/x/tools v0.1.1/go.mod h1:o0xws9oXOQQZyjljx8fwUC0k7L1pTE6eaCbjGeHmOkk=
+-golang.org/x/tools v0.1.5/go.mod h1:o0xws9oXOQQZyjljx8fwUC0k7L1pTE6eaCbjGeHmOkk=
+-golang.org/x/tools v0.1.6 h1:SIasE1FVIQOWz2GEAHFOmoW7xchJcqlucjSULTL0Ag4=
+-golang.org/x/tools v0.1.6/go.mod h1:LGqMHiF4EqQNHR1JncWGqT5BVaXmza+X+BDGol+dOxo=
+ golang.org/x/tools v0.1.7 h1:6j8CgantCy3yc8JGBqkDLMKWqZ0RDU2g1HVgacojGWQ=
+ golang.org/x/tools v0.1.7/go.mod h1:LGqMHiF4EqQNHR1JncWGqT5BVaXmza+X+BDGol+dOxo=
+ golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+@@ -353,8 +338,6 @@ google.golang.org/genproto v0.0.0-20190306203927-b5d61aea6440/go.mod h1:VzzqZJRn
+ google.golang.org/genproto v0.0.0-20190819201941-24fa4b261c55/go.mod h1:DMBHOl98Agz4BDEuKkezgsaosCRResVns1a3J2ZsMNc=
+ google.golang.org/genproto v0.0.0-20200513103714-09dca8ec2884/go.mod h1:55QSHmfGQM9UVYDPBsyGGes0y52j32PQ3BqQfXhyH3c=
+ google.golang.org/genproto v0.0.0-20200526211855-cb27e3aa2013/go.mod h1:NbSheEEYHJ7i3ixzK3sjbqSGDJWnxyFXZblF3eUsNvo=
+-google.golang.org/genproto v0.0.0-20210917145530-b395a37504d4 h1:ysnBoUyeL/H6RCvNRhWHjKoDEmguI+mPU+qHgK8qv/w=
+-google.golang.org/genproto v0.0.0-20210917145530-b395a37504d4/go.mod h1:eFjDcFEctNawg4eG61bRv87N7iHBWyVhJu7u1kqDUXY=
+ google.golang.org/genproto v0.0.0-20211019152133-63b7e35f4404 h1:ZB48alYoIN+Soc1OcXirVKYOhOOf6Pek+iN+L+pzQI4=
+ google.golang.org/genproto v0.0.0-20211019152133-63b7e35f4404/go.mod h1:5CzLGKJ67TSI2B9POpiiyGha0AjJvZIUgRMt1dSmuhc=
+ google.golang.org/grpc v1.14.0/go.mod h1:yo6s7OP7yaDglbqo1J04qKzAhqBH6lvTonzMVmEdcZw=
+diff --git a/infra/conf/web.go b/infra/conf/web.go
+new file mode 100644
+index 0000000..8e19b57
+--- /dev/null
++++ b/infra/conf/web.go
+@@ -0,0 +1,66 @@
++package conf
++
++import (
++	"github.com/xtls/xray-core/app/web/config"
++)
++
++type WebConfig struct {
++	Tag    string          `json:"tag"`
++	Api    *ApiConfig      `json:"api"`
++	Pprof  bool            `json:"pprof"`
++	Static []*StaticConfig `json:"static"`
++}
++
++type ApiConfig struct {
++	Address string `json:"address"`
++	Port    uint32 `json:"port"`
++}
++
++type StaticConfig struct {
++	FilePath string `json:"filePath"`
++	Uri      string `json:"uri"`
++}
++
++func (c *StaticConfig) Build() (*config.Static, error) {
++	if c.FilePath == "" {
++		return nil, newError("could not serve nil filepath")
++	}
++
++	if c.Uri == "" {
++		return nil, newError("could not use void as uri")
++	}
++
++	return &config.Static{
++		FilePath: c.FilePath,
++		Uri:      c.Uri,
++	}, nil
++}
++
++func (c *WebConfig) Build() (*config.Config, error) {
++	if c.Tag == "" {
++		return nil, newError("Web tag can't be empty.")
++	}
++
++	if c.Api == nil {
++		c.Api = &ApiConfig{}
++	}
++
++	conf := &config.Config{
++		Tag: c.Tag,
++		Api: &config.Api{
++			Address: c.Api.Address,
++			Port:    c.Api.Port,
++		},
++		Pprof: c.Pprof,
++	}
++
++	for _, static := range c.Static {
++		s, err := static.Build()
++		if err != nil {
++			return nil, newError("failed to build http file server")
++		}
++		conf.Static = append(conf.Static, s)
++	}
++
++	return conf, nil
++}
+diff --git a/infra/conf/xray.go b/infra/conf/xray.go
+index 8e7290a..b29df3f 100644
+--- a/infra/conf/xray.go
++++ b/infra/conf/xray.go
+@@ -400,6 +400,7 @@ type Config struct {
+ 	Transport       *TransportConfig       `json:"transport"`
+ 	Policy          *PolicyConfig          `json:"policy"`
+ 	API             *APIConfig             `json:"api"`
++	Web             *WebConfig             `json:"web"`
+ 	Stats           *StatsConfig           `json:"stats"`
+ 	Reverse         *ReverseConfig         `json:"reverse"`
+ 	FakeDNS         *FakeDNSConfig         `json:"fakeDns"`
+@@ -449,6 +450,9 @@ func (c *Config) Override(o *Config, fn string) {
+ 	if o.API != nil {
+ 		c.API = o.API
+ 	}
++	if o.Web != nil {
++		c.Web = o.Web
++	}
+ 	if o.Stats != nil {
+ 		c.Stats = o.Stats
+ 	}
+@@ -551,6 +555,14 @@ func (c *Config) Build() (*core.Config, error) {
+ 		config.App = append(config.App, serial.ToTypedMessage(apiConf))
+ 	}
+ 
++	if c.Web != nil {
++		WebConf, err := c.Web.Build()
++		if err != nil {
++			return nil, err
++		}
++		config.App = append(config.App, serial.ToTypedMessage(WebConf))
++	}
++
+ 	if c.Stats != nil {
+ 		statsConf, err := c.Stats.Build()
+ 		if err != nil {
+diff --git a/main/distro/all/all.go b/main/distro/all/all.go
+index ca45123..be78c29 100644
+--- a/main/distro/all/all.go
++++ b/main/distro/all/all.go
+@@ -22,6 +22,7 @@ import (
+ 	_ "github.com/xtls/xray-core/app/reverse"
+ 	_ "github.com/xtls/xray-core/app/router"
+ 	_ "github.com/xtls/xray-core/app/stats"
++	_ "github.com/xtls/xray-core/app/web"
+ 
+ 	// Inbound and outbound proxies.
+ 	_ "github.com/xtls/xray-core/proxy/blackhole"
