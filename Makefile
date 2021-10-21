@@ -11,7 +11,7 @@ PKG_MAINTAINER:=yichya <mail@yichya.dev>
 PKG_SOURCE:=Xray-core-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/XTLS/Xray-core/tar.gz/v${PKG_VERSION}?
 PKG_HASH:=43f35c83902db9d1eba0210c0e27b7814d4caf198cd0424c8af9c97a3ce9a860
-PKG_BUILD_DEPENDS:=golang/host
+PKG_BUILD_DEPENDS:=golang/host upx/host
 PKG_BUILD_PARALLEL:=1
 
 GO_PKG:=github.com/XTLS/Xray-core
@@ -82,6 +82,7 @@ endef
 
 define Build/Compile
 	cd $(PKG_BUILD_DIR); $(GO_PKG_VARS) $(USE_GOPROXY) CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $(PKG_INSTALL_DIR)/bin/xray ./main; 
+	$(STAGING_DIR_HOST)/bin/upx --lzma --best $(PKG_INSTALL_DIR)/bin/xray || true
 endef
 
 define Package/$(PKG_NAME)/install
